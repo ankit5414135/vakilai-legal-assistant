@@ -21,8 +21,7 @@ const upload = multer({
     else cb(new Error("Only PDF files are allowed"), false);
   },
 });
-
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000" }));
+app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "2mb" }));
 
 const pdfContextStore = {};
