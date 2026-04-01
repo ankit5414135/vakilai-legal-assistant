@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const API_BASE = import.meta.env.VITE_API_URL || "";
 const MAX_CHARS = 2000;
+console.log("API:", import.meta.env.VITE_API_URL);
 
 const SUGGESTIONS = [
   { icon: "📋", text: "What are my rights if I'm arrested by police in India?" },
