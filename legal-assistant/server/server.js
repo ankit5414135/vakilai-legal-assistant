@@ -9,6 +9,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+app.get("/", (req, res) => {
+  res.send("Server is running 🚀");
+});
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -17,165 +21,146 @@ const upload = multer({
     else cb(new Error("Only PDF files are allowed"), false);
   },
 });
-
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000" }));
+app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "2mb" }));
 
 const pdfContextStore = {};
 
-const FALLBACK_MODELS = [
-  "google/gemma-3-27b-it:free",
-  "meta-llama/llama-3.1-8b-instruct:free",
-  "deepseek/deepseek-chat-v3-0324:free",
-  "microsoft/phi-4:free",
-];
-
-// ── Health ────────────────────────────────────────────────────────────────────
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// ── POST /chat  (STREAMING — fixes slow response) ─────────────────────────────
-// The frontend reads Server-Sent Events; words appear as they are generated.
+// ─── POST /chat ───────────────────────────────────────────────────────────────
 app.post("/chat", async (req, res) => {
   const { message, history = [], sessionId } = req.body;
 
-  if (!message || typeof message !== "string" || message.trim().length === 0)
-    return res.status(400).json({ error: "Message cannot be empty." });
-  if (message.trim().length > 2000)
-    return res.status(400).json({ error: "Message too long (max 2000 chars)." });
-
-  const KEY = process.env.OPENROUTER_API_KEY;
-  if (!KEY || KEY.includes("your-openrouter"))
-    return res.status(500).json({ error: "OPENROUTER_API_KEY not set in .env" });
-
-  let systemPrompt = `You are VakilAI, a knowledgeable legal assistant specialised in Indian law.
-Provide accurate, clear, and helpful legal information in simple language.
-Never give harmful or illegal advice. Always recommend consulting a qualified lawyer for serious matters.
-Format answers with numbered points or short sections when helpful.
-Be concise — aim for clear, direct answers rather than overly long responses.`;
-
-  if (sessionId && pdfContextStore[sessionId]) {
-    systemPrompt += `\n\nThe user uploaded a legal document. Its text:\n\n${pdfContextStore[sessionId]}\n\nAnswer questions based on this document when relevant.`;
+  if (!message || typeof message !== "string" || message.trim().length === 0) {
+    return res.status(400).json({ error: "Message is required and must be a non-empty string." });
+  }
+  if (message.trim().length > 2000) {
+    return res.status(400).json({ error: "Message is too long. Please keep it under 2000 characters." });
   }
 
+  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+  if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.includes("your-openrouter")) {
+    return res.status(500).json({
+      error: "OpenRouter API key is not set. Please add OPENROUTER_API_KEY to your .env file.",
+    });
+  }
+
+  // Build system prompt
+  let systemPrompt = `You are a legal assistant specialized in Indian law. Provide accurate, simple, and helpful legal information.
+Do not give harmful or illegal advice. Always recommend consulting a qualified lawyer for serious legal matters.
+When explaining laws, use simple language that a layperson can understand.
+Structure your answers clearly using numbered points or sections when appropriate.`;
+
+  if (sessionId && pdfContextStore[sessionId]) {
+    systemPrompt += `\n\nThe user has uploaded a PDF legal document. Here is its content for reference:\n\n${pdfContextStore[sessionId]}\n\nAnswer questions based on this document when relevant.`;
+  }
+
+  const recentHistory = history.slice(-20);
   const messages = [
     { role: "system", content: systemPrompt },
-    ...history.slice(-16),
+    ...recentHistory,
     { role: "user", content: message.trim() },
   ];
 
-  const primaryModel = process.env.OPENROUTER_MODEL || "openrouter/free";
-  const modelsToTry  = [primaryModel, ...FALLBACK_MODELS.filter(m => m !== primaryModel)];
+  // "openrouter/free" automatically picks any currently available free model.
+  // This means it NEVER throws "no endpoints" errors regardless of which
+  // specific models OpenRouter adds or removes from their free tier.
+  const model = process.env.OPENROUTER_MODEL || "openrouter/free";
 
-  // Set up SSE headers so the browser receives tokens in real time
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
+  try {
+    console.log(`🤖 Sending request via model: ${model}`);
 
-  const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "HTTP-Referer": process.env.CLIENT_URL || "http://localhost:3000",
+        "X-Title": "VakilAI Legal Assistant",
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        max_tokens: 1200,
+        temperature: 0.4,
+      }),
+    });
 
-  for (const model of modelsToTry) {
-    try {
-      console.log(`🤖 Trying: ${model}`);
+    const data = await response.json();
 
-      const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${KEY}`,
-          "HTTP-Referer": process.env.CLIENT_URL || "http://localhost:3000",
-          "X-Title": "VakilAI Legal Assistant",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          max_tokens: 1000,
-          temperature: 0.35,
-          stream: true,           // ← enables streaming
-        }),
-      });
-
-      if (!upstream.ok) {
-        const err = await upstream.json().catch(() => ({}));
-        const msg = err?.error?.message || `HTTP ${upstream.status}`;
-        if (msg.toLowerCase().includes("no endpoints") || upstream.status === 404) {
-          console.warn(`⚠ ${model}: ${msg} — trying next`);
-          continue;
-        }
-        sendEvent({ error: msg });
-        res.end();
-        return;
-      }
-
-      // Stream tokens to the client
-      const reader = upstream.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop(); // keep incomplete line
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const raw = line.slice(6).trim();
-          if (raw === "[DONE]") { sendEvent({ done: true }); res.end(); return; }
-          try {
-            const chunk = JSON.parse(raw);
-            const token = chunk.choices?.[0]?.delta?.content;
-            if (token) sendEvent({ token });
-          } catch {}
-        }
-      }
-
-      sendEvent({ done: true });
-      res.end();
-      return;
-
-    } catch (err) {
-      console.warn(`⚠ ${model} error: ${err.message}`);
+    if (!response.ok) {
+      const errMsg = data?.error?.message || `OpenRouter error: ${response.status}`;
+      console.error("OpenRouter API error:", errMsg);
+      return res.status(502).json({ error: errMsg });
     }
-  }
 
-  sendEvent({ error: "All models are currently unavailable. Please try again in a moment." });
-  res.end();
+    const reply = data.choices?.[0]?.message?.content?.trim();
+    if (!reply) {
+      return res.status(502).json({ error: "Empty response from AI model. Please try again." });
+    }
+
+    console.log(`✅ Response received from: ${data.model}`);
+    return res.json({ reply, model: data.model, tokens: data.usage });
+
+  } catch (err) {
+    console.error("Chat error:", err.message);
+    return res.status(500).json({ error: "Internal server error. Please try again." });
+  }
 });
 
-// ── POST /upload-pdf ──────────────────────────────────────────────────────────
+// ─── POST /upload-pdf ─────────────────────────────────────────────────────────
 app.post("/upload-pdf", upload.single("pdf"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No PDF file uploaded." });
+
   const sessionId = req.body.sessionId || `session_${Date.now()}`;
+
   try {
     const parsed = await pdfParse(req.file.buffer);
     let text = parsed.text?.trim();
-    if (!text || text.length < 20)
-      return res.status(400).json({ error: "Could not extract text from PDF. It may be scanned/image-based." });
-    if (text.length > 12000) text = text.slice(0, 12000) + "\n\n[Document truncated…]";
+
+    if (!text || text.length < 20) {
+      return res.status(400).json({
+        error: "Could not extract readable text from this PDF. It may be scanned/image-based.",
+      });
+    }
+
+    if (text.length > 12000) {
+      text = text.slice(0, 12000) + "\n\n[Document truncated due to length...]";
+    }
+
     pdfContextStore[sessionId] = text;
-    return res.json({ sessionId, message: "PDF parsed.", pages: parsed.numpages, characters: text.length });
+
+    return res.json({
+      sessionId,
+      message: "PDF uploaded and parsed successfully.",
+      pages: parsed.numpages,
+      characters: text.length,
+      preview: text.slice(0, 200) + (text.length > 200 ? "..." : ""),
+    });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to parse PDF." });
+    console.error("PDF parse error:", err);
+    return res.status(500).json({ error: "Failed to parse PDF. Please try another file." });
   }
 });
 
-// ── DELETE /clear-pdf ─────────────────────────────────────────────────────────
+// ─── DELETE /clear-pdf ────────────────────────────────────────────────────────
 app.delete("/clear-pdf/:sessionId", (req, res) => {
   delete pdfContextStore[req.params.sessionId];
-  res.json({ message: "Cleared." });
+  res.json({ message: "PDF context cleared." });
 });
 
+// ─── Global error handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
-  if (err.code === "LIMIT_FILE_SIZE") return res.status(400).json({ error: "File too large (max 10MB)." });
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({ error: "File too large. Max size is 10MB." });
+  }
   console.error(err);
-  res.status(500).json({ error: err.message || "Server error." });
+  res.status(500).json({ error: err.message || "Unexpected server error." });
 });
 
 app.listen(PORT, () => {
-  console.log(`⚖  VakilAI server → http://localhost:${PORT}`);
-  console.log(`🤖 Model: ${process.env.OPENROUTER_MODEL || "openrouter/free"}`);
+  console.log(`⚖️  VakilAI server running on http://localhost:${PORT}`);
+  console.log(`🤖 Model: ${process.env.OPENROUTER_MODEL || "openrouter/free (auto-select)"}`);
 });
