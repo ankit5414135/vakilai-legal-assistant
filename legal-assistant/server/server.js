@@ -1,166 +1,219 @@
 const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const pdfParse = require("pdf-parse");
-const dotenv = require("dotenv");
+const cors    = require("cors");
+const multer  = require("multer");
+const pdfParse= require("pdf-parse");
+const dotenv  = require("dotenv");
+const crypto  = require("crypto");
 
 dotenv.config();
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 5000;
 
-app.get("/", (req, res) => {
-  res.send("Server is running 🚀");
-});
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000" }));
+app.use(express.json({ limit: "2mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype === "application/pdf") cb(null, true);
-    else cb(new Error("Only PDF files are allowed"), false);
-  },
+  fileFilter: (_, file, cb) =>
+    file.mimetype === "application/pdf" ? cb(null, true) : cb(new Error("Only PDFs allowed")),
 });
-app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: "2mb" }));
 
-const pdfContextStore = {};
+// ── In-memory stores (replace with a DB for production) ───────────────────────
+const users    = {};   // { email: { name, email, passwordHash, createdAt } }
+const sessions = {};   // { token: email }
+const chatHistory = {}; // { email: [ { id, title, messages:[], createdAt } ] }
+const pdfStore = {};   // { sessionId: text }
 
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const hash  = s => crypto.createHash("sha256").update(s).digest("hex");
+const token = () => crypto.randomBytes(32).toString("hex");
+const uid   = () => crypto.randomBytes(8).toString("hex");
 
-// ─── POST /chat ───────────────────────────────────────────────────────────────
-app.post("/chat", async (req, res) => {
-  const { message, history = [], sessionId } = req.body;
+function authMiddleware(req, res, next) {
+  const t = req.headers.authorization?.split(" ")[1];
+  if (!t || !sessions[t]) return res.status(401).json({ error: "Unauthorized. Please log in." });
+  req.userEmail = sessions[t];
+  next();
+}
 
-  if (!message || typeof message !== "string" || message.trim().length === 0) {
-    return res.status(400).json({ error: "Message is required and must be a non-empty string." });
-  }
-  if (message.trim().length > 2000) {
-    return res.status(400).json({ error: "Message is too long. Please keep it under 2000 characters." });
-  }
+// Seed a demo user so the app works out of the box
+users["demo@vakilai.com"] = {
+  name: "Demo User", email: "demo@vakilai.com",
+  passwordHash: hash("demo123"), createdAt: new Date().toISOString(),
+};
+chatHistory["demo@vakilai.com"] = [];
 
-  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-  if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.includes("your-openrouter")) {
-    return res.status(500).json({
-      error: "OpenRouter API key is not set. Please add OPENROUTER_API_KEY to your .env file.",
-    });
-  }
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => res.json({ status: "ok" }));
 
-  // Build system prompt
-  let systemPrompt = `You are a legal assistant specialized in Indian law. Provide accurate, simple, and helpful legal information.
-Do not give harmful or illegal advice. Always recommend consulting a qualified lawyer for serious legal matters.
-When explaining laws, use simple language that a layperson can understand.
-Structure your answers clearly using numbered points or sections when appropriate.`;
+// ── POST /auth/register ───────────────────────────────────────────────────────
+app.post("/auth/register", (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name || !email || !password)
+    return res.status(400).json({ error: "Name, email and password are required." });
+  if (password.length < 6)
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  if (users[email])
+    return res.status(409).json({ error: "An account with this email already exists." });
 
-  if (sessionId && pdfContextStore[sessionId]) {
-    systemPrompt += `\n\nThe user has uploaded a PDF legal document. Here is its content for reference:\n\n${pdfContextStore[sessionId]}\n\nAnswer questions based on this document when relevant.`;
-  }
+  users[email] = { name: name.trim(), email, passwordHash: hash(password), createdAt: new Date().toISOString() };
+  chatHistory[email] = [];
 
-  const recentHistory = history.slice(-20);
+  const t = token();
+  sessions[t] = email;
+  res.json({ token: t, user: { name: users[email].name, email } });
+});
+
+// ── POST /auth/login ──────────────────────────────────────────────────────────
+app.post("/auth/login", (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    return res.status(400).json({ error: "Email and password are required." });
+
+  const user = users[email];
+  if (!user || user.passwordHash !== hash(password))
+    return res.status(401).json({ error: "Invalid email or password." });
+
+  const t = token();
+  sessions[t] = email;
+  res.json({ token: t, user: { name: user.name, email } });
+});
+
+// ── POST /auth/logout ─────────────────────────────────────────────────────────
+app.post("/auth/logout", authMiddleware, (req, res) => {
+  const t = req.headers.authorization?.split(" ")[1];
+  delete sessions[t];
+  res.json({ message: "Logged out." });
+});
+
+// ── GET /history ──────────────────────────────────────────────────────────────
+app.get("/history", authMiddleware, (req, res) => {
+  const chats = (chatHistory[req.userEmail] || []).map(c => ({
+    id: c.id, title: c.title, createdAt: c.createdAt, messageCount: c.messages.length,
+  }));
+  res.json({ chats: chats.reverse() }); // newest first
+});
+
+// ── GET /history/:id ──────────────────────────────────────────────────────────
+app.get("/history/:id", authMiddleware, (req, res) => {
+  const chat = (chatHistory[req.userEmail] || []).find(c => c.id === req.params.id);
+  if (!chat) return res.status(404).json({ error: "Chat not found." });
+  res.json({ chat });
+});
+
+// ── DELETE /history/:id ───────────────────────────────────────────────────────
+app.delete("/history/:id", authMiddleware, (req, res) => {
+  chatHistory[req.userEmail] = (chatHistory[req.userEmail] || []).filter(c => c.id !== req.params.id);
+  res.json({ message: "Deleted." });
+});
+
+// ── POST /chat ────────────────────────────────────────────────────────────────
+app.post("/chat", authMiddleware, async (req, res) => {
+  const { message, history = [], chatId } = req.body;
+
+  if (!message?.trim()) return res.status(400).json({ error: "Message cannot be empty." });
+  if (message.length > 2000) return res.status(400).json({ error: "Message too long." });
+
+  const KEY = process.env.OPENROUTER_API_KEY;
+  if (!KEY || KEY.includes("your-")) return res.status(500).json({ error: "API key not configured." });
+
+  const systemPrompt = `You are VakilAI, an expert legal assistant specialised in Indian law.
+Answer clearly and concisely in simple language. Use numbered points when listing steps.
+Never give harmful or illegal advice. Recommend consulting a qualified advocate for personal legal matters.`;
+
   const messages = [
     { role: "system", content: systemPrompt },
-    ...recentHistory,
+    ...history.slice(-20),
     { role: "user", content: message.trim() },
   ];
 
-  // "openrouter/free" automatically picks any currently available free model.
-  // This means it NEVER throws "no endpoints" errors regardless of which
-  // specific models OpenRouter adds or removes from their free tier.
-  const model = process.env.OPENROUTER_MODEL || "openrouter/free";
+  // Try models in order — non-streaming for reliability
+  const MODELS = [
+    process.env.OPENROUTER_MODEL || "meta-llama/llama-3.1-8b-instruct:free",
+    "google/gemma-3-12b-it:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "microsoft/phi-4:free",
+    "openrouter/auto",
+  ];
 
-  try {
-    console.log(`🤖 Sending request via model: ${model}`);
+  let reply = null;
 
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": process.env.CLIENT_URL || "http://localhost:3000",
-        "X-Title": "VakilAI Legal Assistant",
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_tokens: 1200,
-        temperature: 0.4,
-      }),
-    });
+  for (const model of MODELS) {
+    try {
+      console.log(`🤖 Trying ${model}…`);
+      const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type":  "application/json",
+          "Authorization": `Bearer ${KEY}`,
+          "HTTP-Referer":  process.env.CLIENT_URL || "http://localhost:3000",
+          "X-Title":       "VakilAI",
+        },
+        body: JSON.stringify({ model, messages, max_tokens: 1200, temperature: 0.4, stream: false }),
+      });
 
-    const data = await response.json();
+      const data = await r.json();
 
-    if (!response.ok) {
-      const errMsg = data?.error?.message || `OpenRouter error: ${response.status}`;
-      console.error("OpenRouter API error:", errMsg);
-      return res.status(502).json({ error: errMsg });
+      if (!r.ok) {
+        const msg = data?.error?.message || "";
+        console.warn(`  ✗ ${model}: ${msg}`);
+        if (msg.includes("No endpoints") || r.status === 404 || r.status === 400) continue;
+        // Auth or rate-limit — stop trying
+        return res.status(502).json({ error: msg || "API error." });
+      }
+
+      reply = data.choices?.[0]?.message?.content?.trim();
+      if (reply) { console.log(`  ✓ ${model}`); break; }
+    } catch (e) {
+      console.warn(`  ✗ ${model}: ${e.message}`);
     }
-
-    const reply = data.choices?.[0]?.message?.content?.trim();
-    if (!reply) {
-      return res.status(502).json({ error: "Empty response from AI model. Please try again." });
-    }
-
-    console.log(`✅ Response received from: ${data.model}`);
-    return res.json({ reply, model: data.model, tokens: data.usage });
-
-  } catch (err) {
-    console.error("Chat error:", err.message);
-    return res.status(500).json({ error: "Internal server error. Please try again." });
   }
+
+  if (!reply) return res.status(502).json({ error: "All models unavailable right now. Please try again in a moment." });
+
+  // Save / update chat history
+  const email = req.userEmail;
+  if (!chatHistory[email]) chatHistory[email] = [];
+
+  let chat = chatHistory[email].find(c => c.id === chatId);
+  if (!chat) {
+    // New conversation
+    const title = message.trim().slice(0, 60) + (message.length > 60 ? "…" : "");
+    chat = { id: uid(), title, messages: [], createdAt: new Date().toISOString() };
+    chatHistory[email].push(chat);
+  }
+
+  // Append both turns
+  chat.messages.push(
+    { role: "user",      content: message.trim(), ts: new Date().toISOString() },
+    { role: "assistant", content: reply,           ts: new Date().toISOString() },
+  );
+
+  res.json({ reply, chatId: chat.id });
 });
 
-// ─── POST /upload-pdf ─────────────────────────────────────────────────────────
-app.post("/upload-pdf", upload.single("pdf"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No PDF file uploaded." });
-
-  const sessionId = req.body.sessionId || `session_${Date.now()}`;
-
+// ── PDF upload ────────────────────────────────────────────────────────────────
+app.post("/upload-pdf", authMiddleware, upload.single("pdf"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file." });
   try {
     const parsed = await pdfParse(req.file.buffer);
     let text = parsed.text?.trim();
-
-    if (!text || text.length < 20) {
-      return res.status(400).json({
-        error: "Could not extract readable text from this PDF. It may be scanned/image-based.",
-      });
-    }
-
-    if (text.length > 12000) {
-      text = text.slice(0, 12000) + "\n\n[Document truncated due to length...]";
-    }
-
-    pdfContextStore[sessionId] = text;
-
-    return res.json({
-      sessionId,
-      message: "PDF uploaded and parsed successfully.",
-      pages: parsed.numpages,
-      characters: text.length,
-      preview: text.slice(0, 200) + (text.length > 200 ? "..." : ""),
-    });
-  } catch (err) {
-    console.error("PDF parse error:", err);
-    return res.status(500).json({ error: "Failed to parse PDF. Please try another file." });
-  }
+    if (!text || text.length < 20) return res.status(400).json({ error: "No readable text in PDF." });
+    if (text.length > 12000) text = text.slice(0, 12000) + "\n[Truncated]";
+    const sid = req.body.sessionId || uid();
+    pdfStore[sid] = text;
+    res.json({ sessionId: sid, pages: parsed.numpages });
+  } catch { res.status(500).json({ error: "PDF parse failed." }); }
 });
 
-// ─── DELETE /clear-pdf ────────────────────────────────────────────────────────
-app.delete("/clear-pdf/:sessionId", (req, res) => {
-  delete pdfContextStore[req.params.sessionId];
-  res.json({ message: "PDF context cleared." });
-});
-
-// ─── Global error handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
-  if (err.code === "LIMIT_FILE_SIZE") {
-    return res.status(400).json({ error: "File too large. Max size is 10MB." });
-  }
-  console.error(err);
-  res.status(500).json({ error: err.message || "Unexpected server error." });
+  if (err.code === "LIMIT_FILE_SIZE") return res.status(400).json({ error: "Max 10 MB." });
+  res.status(500).json({ error: err.message });
 });
 
 app.listen(PORT, () => {
-  console.log(`⚖️  VakilAI server running on http://localhost:${PORT}`);
-  console.log(`🤖 Model: ${process.env.OPENROUTER_MODEL || "openrouter/free (auto-select)"}`);
+  console.log(`⚖  VakilAI  →  http://localhost:${PORT}`);
+  console.log(`📧 Demo login: demo@vakilai.com / demo123`);
 });
